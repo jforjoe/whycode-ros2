@@ -1,0 +1,3 @@
+[submodule "whycode-generator"]
+	path = whycode-generator
+	url = git@github.com:jiriUlr/whycode-generator.git
