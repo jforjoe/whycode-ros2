@@ -432,13 +432,32 @@ SEllipseCenters CTransformation::calcEigen(const float *data)
             result.n[idx][1] = n1;
             result.n[idx][2] = n2;
 
+
+            /* Original image coords */
             /* image coords -> camera coords
                    t2  ~  z -> x
                   -t0  ~ -x -> y
                   -t1  ~ -y -> z */
-            result.t[idx][0] = t2;
-            result.t[idx][1] = -t0;
-            result.t[idx][2] = -t1;
+            // result.t[idx][0] = t2;
+            // result.t[idx][1] = -t0;
+            // result.t[idx][2] = -t1;
+
+
+
+
+            /* image coords -> output frame: RIGHT-HANDED, z away from camera
+                   t0  ~  left      -> x
+                   t1  ~  up       -> y
+                   t2  ~  depth away -> z
+               right-handed: x cross y = z */
+            result.t[idx][0] = -t0;
+            result.t[idx][1] = -t1;
+            result.t[idx][2] = t2;
+
+
+
+
+
 
             reTransformXY(t0, t1, t2);
             result.u[idx] = t0;
@@ -539,10 +558,10 @@ void CTransformation::calcOrientation(STrackedObject &obj)
 // https://en.wikipedia.org/wiki/Quaternion#Hamilton_product
 void CTransformation::calcQuaternion(STrackedObject &obj)
 {
-    // cv::Vec3f initial_norm(0.0, 0.0, 1.0);
-    // cv::Vec3f final_norm(obj.n0, obj.n1, obj.n2);
-    cv::Vec3f initial_norm(1.0, 0.0, 0.0);
-    cv::Vec3f final_norm(obj.n2, -obj.n0, -obj.n1);
+    cv::Vec3f initial_norm(0.0, 0.0, 1.0);
+    cv::Vec3f final_norm(-obj.n0, -obj.n1, obj.n2);
+    // cv::Vec3f initial_norm(1.0, 0.0, 0.0);
+    // cv::Vec3f final_norm(obj.n2, -obj.n0, -obj.n1);
     cv::normalize(final_norm, final_norm);
 
     cv::Vec3f axis_vec = final_norm.cross(initial_norm);
