@@ -21,7 +21,7 @@ def generate_launch_description():
                 'camera_frame_id': 'usb_cam',
                 'av_device_format': 'YUV422P',
                 'camera_name': 'narrow_stereo',
-                'camera_info_url': 'file:///home/joe/.ros/camera_info/camera_info.yaml',
+                'camera_info_url': 'file://$(env HOME)/.ros/camera_info/camera_info.yaml',
             }]
         ),
 
