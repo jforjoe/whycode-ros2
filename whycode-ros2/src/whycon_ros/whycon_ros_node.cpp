@@ -4,6 +4,9 @@
 #include <memory>
 #include <string>
 #include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <vector>
 
 using std::placeholders::_1;
 using std::placeholders::_2;
@@ -154,12 +157,70 @@ void CWhyconROSNode::cameraInfoCallback(const sensor_msgs::msg::CameraInfo::Shar
 void CWhyconROSNode::imageCallback(const sensor_msgs::msg::Image::ConstSharedPtr &msg)
 {
     image_->updateImage((unsigned char*)&msg->data[0], msg->width, msg->height, msg->step / msg->width);
+    processCurrentImage(msg->header);
+}
 
+// Reads the newest frame out of the shared-memory ring, if there is one that
+// is newer than the last one processed, and runs the detector over it.
+//
+// Note there is no catch-up loop here: read_latest hands back only the MOST
+// RECENT completed frame and silently skips anything the producer wrote while
+// the detector was busy. That is the correct behaviour for vision in a control
+// loop -- processing a backlog would mean feeding the controller positions the
+// drone held several frames ago, which is worse than feeding it nothing.
+void CWhyconROSNode::shmPollCallback()
+{
+    if(!shm_reader_.try_attach())
+    {
+        return;  // producer not up yet -- keep polling, this is not an error
+    }
+
+    if(!shm_logged_attach_)
+    {
+        shm_logged_attach_ = true;
+        RCLCPP_INFO(this->get_logger(), "Attached to frame ring: %dx%d, %d channels.",
+                    shm_reader_.width(), shm_reader_.height(), shm_reader_.channels());
+    }
+
+    // Size image_ to the ring's geometry ONCE, so that from here on the frame
+    // can be copied straight out of shared memory into the detector's own
+    // buffer -- no staging vector, no second copy. CRawImage::updateImage is
+    // only used for its (re)allocation side effect; the zeros it copies are
+    // overwritten by the very next read_latest.
+    const int w = shm_reader_.width();
+    const int h = shm_reader_.height();
+    const int c = shm_reader_.channels();
+    if(image_->width_ != w || image_->height_ != h || image_->bpp_ != c)
+    {
+        std::vector<unsigned char> blank(static_cast<std::size_t>(w) * h * c, 0);
+        image_->updateImage(blank.data(), w, h, c);
+    }
+
+    double sim_time = 0.0;
+    if(!shm_reader_.read_latest(image_->data_, static_cast<std::size_t>(image_->size_), &sim_time))
+    {
+        return;  // nothing new since last poll -- the common case
+    }
+
+    // The producer stamps each slot with the sim time of the PIXELS, which its
+    // pipelined readback makes one render period older than the sim state at
+    // the moment of the write. Carry it through unchanged: re-stamping with
+    // now() here would throw away that correction and hand the controller a
+    // phase error.
+    std_msgs::msg::Header header;
+    header.stamp.sec = static_cast<int32_t>(sim_time);
+    header.stamp.nanosec = static_cast<uint32_t>((sim_time - header.stamp.sec) * 1e9);
+    header.frame_id = shm_frame_id_;
+    processCurrentImage(header);
+}
+
+void CWhyconROSNode::processCurrentImage(const std_msgs::msg::Header &header)
+{
     whycon_.processImage(image_, whycon_detections_);
 
     whycode_interfaces::msg::MarkerArray marker_array;
-    marker_array.header.stamp = msg->header.stamp;
-    marker_array.header.frame_id = msg->header.frame_id;
+    marker_array.header.stamp = header.stamp;
+    marker_array.header.frame_id = header.frame_id;
 
     for(const whycon::SMarker &detection : whycon_detections_)
     {
@@ -191,14 +252,18 @@ void CWhyconROSNode::imageCallback(const sensor_msgs::msg::Image::ConstSharedPtr
 
     if(use_gui_)
     {
+        // Built from image_ rather than from an input message, so this works
+        // identically whichever transport the frame arrived on. image_->data_
+        // is what the detector just drew its overlays into.
+        const size_t step = static_cast<size_t>(image_->width_) * image_->bpp_;
         sensor_msgs::msg::Image out_msg;
-        out_msg.header = msg->header;
-        out_msg.height = msg->height;
-        out_msg.width = msg->width;
-        out_msg.encoding = msg->encoding;
-        out_msg.step = msg->step;
-        out_msg.data.resize(msg->step * msg->height);
-        std::memcpy((void*)&out_msg.data[0], image_->data_, msg->step * msg->height);
+        out_msg.header = header;
+        out_msg.height = image_->height_;
+        out_msg.width = image_->width_;
+        out_msg.encoding = image_->bpp_ == 1 ? "mono8" : "rgb8";
+        out_msg.step = static_cast<uint32_t>(step);
+        out_msg.data.resize(step * image_->height_);
+        std::memcpy((void*)&out_msg.data[0], image_->data_, step * image_->height_);
         img_pub_.publish(out_msg);
     }
 
@@ -232,6 +297,21 @@ CWhyconROSNode::CWhyconROSNode() :
     this->declare_parameter("img_transport", std::string(""));
     this->declare_parameter("info_topic", std::string(""));
 
+    // Shared-memory frame source. Empty (the default) keeps the original
+    // image_transport subscription, so an existing launch file that does not
+    // set this behaves exactly as before. Setting it to the producer's ring
+    // name switches transports entirely -- see shm_image.hpp for why.
+    this->declare_parameter("img_shm_name", std::string(""));
+    // Poll rate for that ring. Well above the frame rate on purpose: the ring
+    // has no way to wake us, so this sets the worst-case added latency
+    // (1/poll_hz). At 200Hz that is 5ms against a ~30Hz frame period, and a
+    // poll that finds nothing is a single atomic load.
+    this->declare_parameter("img_shm_poll_hz", 200.0);
+    // The ring carries pixels and a timestamp but no frame_id, so the one to
+    // stamp markers with is named here. Must match what the producer would
+    // have put on /image_raw or downstream TF lookups break.
+    this->declare_parameter("img_shm_frame_id", std::string("camera_optical"));
+
     use_gui_ = this->get_parameter("use_gui").as_bool();
     circle_diameter_ = this->get_parameter("circle_diameter").as_double();
     id_bits = this->get_parameter("id_bits").as_int();
@@ -245,6 +325,16 @@ CWhyconROSNode::CWhyconROSNode() :
     img_transport = this->get_parameter("img_transport").as_string();
     info_topic = this->get_parameter("info_topic").as_string();
 
+    const std::string img_shm_name = this->get_parameter("img_shm_name").as_string();
+    double img_shm_poll_hz = this->get_parameter("img_shm_poll_hz").as_double();
+    shm_frame_id_ = this->get_parameter("img_shm_frame_id").as_string();
+    use_shm_ = !img_shm_name.empty();
+    if(img_shm_poll_hz <= 0.0)
+    {
+        RCLCPP_WARN(this->get_logger(), "img_shm_poll_hz must be > 0; using 200.");
+        img_shm_poll_hz = 200.0;
+    }
+
     
     int default_width = 640;
     int default_height = 480;
@@ -256,8 +346,25 @@ CWhyconROSNode::CWhyconROSNode() :
     cam_info_sub_ = this->create_subscription<sensor_msgs::msg::CameraInfo>(info_topic, 1, std::bind(&CWhyconROSNode::cameraInfoCallback, this, _1));
     markers_pub_ = this->create_publisher<whycode_interfaces::msg::MarkerArray>("~/markers", 1);
 
-    // "image_transport" parameter can chagne the transport during startup. default is "raw" (see image_transport::TransportHints)
-    img_sub_ = image_transport::create_subscription(this, img_base_topic, std::bind(&CWhyconROSNode::imageCallback, this, _1), img_transport);
+    if(use_shm_)
+    {
+        // The ring replaces the subscription outright. Creating both would
+        // mean the detector ran twice per frame on two copies of the same
+        // pixels, which is exactly the cost this path exists to remove.
+        shm_reader_.configure(img_shm_name);
+        shm_timer_ = this->create_wall_timer(
+            std::chrono::duration<double>(1.0 / img_shm_poll_hz),
+            std::bind(&CWhyconROSNode::shmPollCallback, this));
+        RCLCPP_INFO(this->get_logger(),
+                    "Frames from shared-memory ring '%s' (polled at %.0f Hz); "
+                    "not subscribing to '%s'.",
+                    img_shm_name.c_str(), img_shm_poll_hz, img_base_topic.c_str());
+    }
+    else
+    {
+        // "image_transport" parameter can chagne the transport during startup. default is "raw" (see image_transport::TransportHints)
+        img_sub_ = image_transport::create_subscription(this, img_base_topic, std::bind(&CWhyconROSNode::imageCallback, this, _1), img_transport);
+    }
     img_pub_ = image_transport::create_publisher(this, "~/processed_image");
 
 

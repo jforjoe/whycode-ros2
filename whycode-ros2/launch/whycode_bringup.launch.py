@@ -39,7 +39,7 @@ def generate_launch_description():
                 'id_bits': 3,
                 'id_samples': 720,
                 'hamming_dist': 1,
-                'num_markers': 10,         # max markers to detect simultaneously
+                'num_markers': 1,         # max markers to detect simultaneously
                 'use_gui': True,           # MUST be true, or processed_image is not published
                 'min_size': 20,
                 'calib_file': '',          # empty = camera-relative pose
